@@ -210,6 +210,23 @@ std::string formatSerial(const std::array<std::uint8_t, 6>& serial) {
     return out.str();
 }
 
+/// Lowercase hex dump such as "b0 01 02", truncated to 64 bytes for logs.
+std::string hexBytes(const std::uint8_t* data, std::size_t size) {
+    constexpr std::size_t maxBytes = 64;
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (std::size_t i = 0; i < std::min(size, maxBytes); ++i) {
+        if (i) {
+            out << ' ';
+        }
+        out << std::setw(2) << static_cast<unsigned>(data[i]);
+    }
+    if (size > maxBytes) {
+        out << " ...";
+    }
+    return out.str();
+}
+
 float signedUnitFromU12(std::uint16_t raw) {
     const float value = static_cast<float>(std::min<std::uint16_t>(raw, 4095u)) / 4095.0f;
     return std::clamp(value * 2.0f - 1.0f, -1.0f, 1.0f);
@@ -579,7 +596,9 @@ private:
         default:
             if (unknownCommandsLogged_.insert(command).second) {
                 libera::logInfo("[LaserCubeVirtual] unhandled command",
-                                static_cast<int>(command), "size", size);
+                                hexBytes(&command, 1), "size", size,
+                                "from", sender.address().to_string() + ":" + std::to_string(sender.port()),
+                                "bytes", hexBytes(data, size));
             }
             reply(sender, command);
             return;
