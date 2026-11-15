@@ -24,7 +24,6 @@
 
 using namespace std::chrono_literals;
 namespace vc = libera_link::virtual_controller;
-namespace asio = libera::net::asio;
 using libera::net::udp;
 
 namespace {
