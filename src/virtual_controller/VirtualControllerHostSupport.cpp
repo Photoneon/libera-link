@@ -93,7 +93,7 @@ std::string shellQuote(std::string_view text) {
 #endif
 }
 
-std::optional<unsigned> prefixLength(const std::string& netmask) {
+[[maybe_unused]] std::optional<unsigned> prefixLength(const std::string& netmask) {
     const auto mask = ipv4ToHost(netmask);
     if (!mask) {
         return std::nullopt;

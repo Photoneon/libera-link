@@ -94,9 +94,12 @@ struct HostOptions {
     std::uint16_t commandPort = defaultCommandPort;
     std::uint16_t dataPort = defaultDataPort;
     std::uint16_t bufferCapacity = 6000;
-    std::uint32_t maxPointRate = 35000;
+    /// Upper limit for the reported max point rate; 0 means no limit.
+    std::uint32_t maxPointRateCap = 0;
+    /// Max point rate reported when the linked controller does not report one.
+    std::uint32_t fallbackMaxPointRate = 35000;
     std::uint32_t defaultPointRate = 30000;
-    std::string modelName = "LaserCube";
+    std::string modelName = "Virtual LaserCube";
     std::uint8_t modelNumber = 6;
     std::uint8_t firmwareMajor = 0;
     std::uint8_t firmwareMinor = 23;
@@ -147,10 +150,12 @@ HostOptions makeHostOptions(const VirtualControllerHostConfig& config) {
     options.dataPort = optionU16(config, "data_port", options.dataPort);
     options.bufferCapacity = std::max<std::uint16_t>(
         bytesPerPoint, optionU16(config, "buffer_capacity", options.bufferCapacity));
-    options.maxPointRate = std::max<std::uint32_t>(
-        1000u, optionU32(config, "max_point_rate", options.maxPointRate));
-    options.defaultPointRate = std::clamp<std::uint32_t>(
-        optionU32(config, "default_point_rate", options.defaultPointRate), 1u, options.maxPointRate);
+    options.maxPointRateCap = optionU32(config, "max_point_rate", options.maxPointRateCap);
+    if (options.maxPointRateCap > 0) {
+        options.maxPointRateCap = std::max<std::uint32_t>(1000u, options.maxPointRateCap);
+    }
+    options.defaultPointRate = std::max<std::uint32_t>(
+        1u, optionU32(config, "default_point_rate", options.defaultPointRate));
     options.modelName = optionString(config, "model_name", options.modelName);
     if (options.modelName.size() > fullInfoSize - fullInfoModelNameOffset - 1) {
         options.modelName.resize(fullInfoSize - fullInfoModelNameOffset - 1);
@@ -302,6 +307,13 @@ public:
         , commandSocket_(io)
         , dataSocket_(io)
         , playbackTimer_(io) {
+        // Report the linked controller's max point rate, limited by the
+        // optional max_point_rate cap.
+        const auto targetMax = target_.sink ? target_.sink->targetInfo().maxPointRate : 0u;
+        maxPointRate_ = targetMax > 0 ? targetMax : options_.fallbackMaxPointRate;
+        if (options_.maxPointRateCap > 0) {
+            maxPointRate_ = std::min(maxPointRate_, options_.maxPointRateCap);
+        }
         resetState();
     }
 
@@ -392,7 +404,7 @@ public:
         endpoint.attributes["data_port"] = std::to_string(options_.dataPort);
         endpoint.attributes["model_name"] = options_.modelName;
         endpoint.attributes["buffer_capacity"] = std::to_string(options_.bufferCapacity);
-        endpoint.attributes["max_point_rate"] = std::to_string(options_.maxPointRate);
+        endpoint.attributes["max_point_rate"] = std::to_string(maxPointRate_);
         return endpoint;
     }
 
@@ -424,7 +436,7 @@ private:
         packet[8] = 0xff; // 0x0fff as reported by a real cube (likely the 12-bit DAC maximum)
         packet[9] = 0x0f;
         putLe32(10, pointRate_);
-        putLe32(14, options_.maxPointRate);
+        putLe32(14, maxPointRate_);
         packet[18] = 0x03; // unknown, as reported by a real cube
         putLe16(19, bufferFree());
         putLe16(21, options_.bufferCapacity);
@@ -544,7 +556,7 @@ private:
             replyU32(sender, command, pointRate_);
             return;
         case cmdGetMaxIldaRate:
-            replyU32(sender, command, options_.maxPointRate);
+            replyU32(sender, command, maxPointRate_);
             return;
         case cmdGetRingBufferSampleCount:
             replyU16(sender, command,
@@ -575,7 +587,7 @@ private:
     }
 
     void setPointRate(std::uint32_t rate) {
-        rate = std::clamp<std::uint32_t>(rate, 1u, options_.maxPointRate);
+        rate = std::clamp<std::uint32_t>(rate, 1u, maxPointRate_);
         if (rate != pointRate_) {
             pointRate_ = rate;
             resetPlaybackClock();
@@ -690,7 +702,7 @@ private:
 
     void resetState() {
         buffer_.clear();
-        pointRate_ = options_.defaultPointRate;
+        pointRate_ = std::min(options_.defaultPointRate, maxPointRate_);
         outputEnabled_ = options_.outputEnabledAtStart;
         bufferResponseEnabled_ = true;
         droppedPoints_ = 0;
@@ -718,6 +730,7 @@ private:
 
     // All state below is only touched on the host's io thread.
     std::deque<LaserPoint> buffer_;
+    std::uint32_t maxPointRate_ = 35000;
     std::uint32_t pointRate_ = 30000;
     bool outputEnabled_ = true;
     bool bufferResponseEnabled_ = true;
@@ -880,7 +893,7 @@ VirtualControllerHostRegistrar gLaserCubeVirtualControllerHostRegistrar({
                 "Model Name",
                 "Model name reported to LaserCube software.",
                 VirtualControllerHostOptionType::String,
-                "LaserCube",
+                "Virtual LaserCube",
                 {},
                 false,
             },
@@ -896,9 +909,10 @@ VirtualControllerHostRegistrar gLaserCubeVirtualControllerHostRegistrar({
             {
                 "max_point_rate",
                 "Max Point Rate",
-                "Maximum point rate reported to LaserCube software.",
+                "Upper limit for the max point rate reported to LaserCube software. 0 reports the "
+                "linked controller's own maximum (35000 when it reports none).",
                 VirtualControllerHostOptionType::Integer,
-                "35000",
+                "0",
                 {},
                 false,
             },

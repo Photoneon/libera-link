@@ -20,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -49,11 +50,11 @@ int g_failures = 0;
 
 class RecordingSink final : public vc::TargetSink {
 public:
-    explicit RecordingSink(std::string id) {
+    explicit RecordingSink(std::string id, std::uint32_t maxPointRate = 100000) {
         info_.id = std::move(id);
         info_.label = "Recording target";
         info_.type = "test";
-        info_.maxPointRate = 100000;
+        info_.maxPointRate = maxPointRate;
     }
 
     const vc::TargetInfo& targetInfo() const override { return info_; }
@@ -420,6 +421,62 @@ void testWithLiberaLaserCubeClient() {
     ASSERT_TRUE(bufferState.has_value(), "client tracks buffer state from acks");
 }
 
+std::optional<libera::lasercubenet::LaserCubeNetStatus> queryStatus(std::uint16_t commandPort) {
+    Client client;
+    client.send("127.0.0.1", commandPort, {0x77});
+    auto reply = client.receive(1000ms);
+    if (!reply) {
+        return std::nullopt;
+    }
+    return libera::lasercubenet::LaserCubeNetStatus::parse(reply->data(), reply->size());
+}
+
+/// The reported max point rate follows the linked controller, limited by the
+/// optional max_point_rate cap, and the default name is "Virtual LaserCube".
+void testMaxPointRateAndName() {
+    struct Case {
+        std::uint32_t targetMax;
+        const char* cap;
+        std::uint32_t expected;
+        const char* label;
+    };
+    const Case cases[] = {
+        {100000, nullptr, 100000, "uses the linked controller's max rate"},
+        {0, nullptr, 35000, "falls back when the controller reports no max rate"},
+        {100000, "35000", 35000, "cap limits the controller's max rate"},
+        {20000, "35000", 20000, "cap does not raise a lower controller max rate"},
+    };
+    for (const auto& c : cases) {
+        auto sink = std::make_shared<RecordingSink>("helios:rate", c.targetMax);
+        std::unordered_map<std::string, std::string> options{
+            {"addresses", "127.0.0.1"},
+            {"alive_port", "47456"},
+            {"command_port", "47457"},
+            {"data_port", "47458"},
+            {"discovery", "false"},
+        };
+        if (c.cap != nullptr) {
+            options["max_point_rate"] = c.cap;
+        }
+        std::string error;
+        auto host = createHost(options, sink, error);
+        ASSERT_TRUE(host != nullptr, error.c_str());
+        if (!host) {
+            continue;
+        }
+        const auto status = queryStatus(47457);
+        ASSERT_TRUE(status.has_value(), "status reply");
+        if (status) {
+            ASSERT_EQ(status->pointRateMax, c.expected, c.label);
+            ASSERT_TRUE(status->pointRate <= c.expected, "default rate within max");
+            ASSERT_TRUE(status->modelName == "Virtual LaserCube", "default model name");
+        }
+        ASSERT_TRUE(host->endpoints().at(0).attributes.at("max_point_rate") == std::to_string(c.expected),
+                    "endpoint reports the effective max rate");
+        host->stop();
+    }
+}
+
 void testSerialFilter() {
     ASSERT_TRUE(vc::isVirtualLaserCubeSerial("4C4C4B010203"), "virtual prefix");
     ASSERT_TRUE(vc::isVirtualLaserCubeSerial("4c4c4b010203"), "case insensitive");
@@ -432,6 +489,7 @@ void testSerialFilter() {
 int main() {
     testSerialFilter();
     testProtocol();
+    testMaxPointRateAndName();
     testWithLiberaLaserCubeClient();
 
     if (g_failures != 0) {

@@ -96,10 +96,13 @@ tests and future UI work, but the app currently loads the `idn`, `libera`, and
 
 The LaserCube host answers LaserOS discovery (UDP 45456) and LaserCube status
 queries (UDP 45457), and accepts point data on UDP 45458. Allow UDP
-45456-45458 in the firewall. Each virtual cube reports itself like a Cube2
-Ultra (model 6, firmware 0.23); `model_name` changes the displayed name. It reports a 6000-point buffer and
-acknowledges every data packet with its free buffer space, which LaserCube
-software uses for pacing. Points play out at the rate the software selects.
+45456-45458 in the firewall. Each virtual cube appears as "Virtual LaserCube"
+(change it with `model_name`) and otherwise reports itself like a Cube2 Ultra
+(model 6, firmware 0.23). Its max point rate is the linked controller's own
+maximum, or 35000 when the controller reports none; `max_point_rate` sets an
+upper limit. It reports a 6000-point buffer and acknowledges every data packet
+with its free buffer space, which LaserCube software uses for pacing. Points
+play out at the rate the software selects.
 
 Because LaserCube software tells devices apart by IP address, each virtual
 LaserCube needs its own local IPv4 address. With `ip_mode=auto` (the default),
