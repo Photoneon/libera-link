@@ -33,6 +33,10 @@ namespace {
 
 // LaserCube / LaserDock network protocol, device side.
 //
+// UDP alive port (45456):
+//   - LaserOS broadcasts ALIVE (0x27) to the subnet broadcast address from
+//     its own port 45456 about twice a second. A LaserCube answers [0x27, 0x00]
+//     from its port 45456 to the sender. This is how LaserOS finds devices.
 // UDP command port (45457):
 //   - Clients broadcast GET_FULL_INFO (0x77). Each device answers with a
 //     64-byte status packet from its own address. The client takes the
@@ -53,6 +57,7 @@ using libera::net::udp;
 namespace asio = libera::net::asio;
 using namespace std::chrono_literals;
 
+constexpr std::uint8_t cmdAlive = 0x27;
 constexpr std::uint8_t cmdGetFullInfo = 0x77;
 constexpr std::uint8_t cmdEnableBufferResponse = 0x78;
 constexpr std::uint8_t cmdSetOutput = 0x80;
@@ -67,6 +72,7 @@ constexpr std::uint8_t cmdGetVersionMinor = 0x8c;
 constexpr std::uint8_t cmdClearRingBuffer = 0x8d;
 constexpr std::uint8_t cmdSampleData = 0xa9;
 
+constexpr std::uint16_t defaultAlivePort = 45456;
 constexpr std::uint16_t defaultCommandPort = 45457;
 constexpr std::uint16_t defaultDataPort = 45458;
 constexpr std::size_t fullInfoSize = 64;
@@ -74,25 +80,27 @@ constexpr std::size_t fullInfoModelNameOffset = 38;
 constexpr std::size_t sampleHeaderSize = 4;
 constexpr std::size_t bytesPerPoint = 10;
 constexpr std::size_t maxDatagramSize = 2048;
-// GET_FULL_INFO requests are a single byte; status replies from other
-// LaserCubes (or our own, looped back) are 64 bytes and must be ignored.
+// GET_FULL_INFO and ALIVE requests are a single byte. Replies from other
+// LaserCubes (or our own, looped back) are longer and must be ignored.
 constexpr std::size_t maxFullInfoRequestSize = 4;
+constexpr std::size_t maxAliveRequestSize = 1;
 
 struct HostOptions {
     support::IpAliasOptions alias;
     bool discoveryEnabled = true;
     bool discoveryBindAuto = true;
     std::vector<std::string> discoveryBindAddresses;
+    std::uint16_t alivePort = defaultAlivePort;
     std::uint16_t commandPort = defaultCommandPort;
     std::uint16_t dataPort = defaultDataPort;
     std::uint16_t bufferCapacity = 6000;
-    std::uint32_t maxPointRate = 40000;
+    std::uint32_t maxPointRate = 35000;
     std::uint32_t defaultPointRate = 30000;
     std::string modelName = "LaserCube";
-    std::uint8_t modelNumber = 0;
+    std::uint8_t modelNumber = 6;
     std::uint8_t firmwareMajor = 0;
-    std::uint8_t firmwareMinor = 13;
-    std::uint8_t connectionType = 0;
+    std::uint8_t firmwareMinor = 23;
+    std::uint8_t connectionType = 3;
     bool outputEnabledAtStart = true;
     bool flipX = true;
     bool flipY = false;
@@ -134,6 +142,7 @@ HostOptions makeHostOptions(const VirtualControllerHostConfig& config) {
         options.discoveryBindAuto = false;
         options.discoveryBindAddresses = splitCsv(bindIt->second);
     }
+    options.alivePort = optionU16(config, "alive_port", options.alivePort);
     options.commandPort = optionU16(config, "command_port", options.commandPort);
     options.dataPort = optionU16(config, "data_port", options.dataPort);
     options.bufferCapacity = std::max<std::uint16_t>(
@@ -163,10 +172,12 @@ HostOptions makeHostOptions(const VirtualControllerHostConfig& config) {
     options.playbackSliceUs = std::max<std::uint32_t>(
         1000u, optionU32(config, "playback_slice_us", options.playbackSliceUs));
 
+    const auto alivePort = options.alivePort;
     const auto commandPort = options.commandPort;
     const auto dataPort = options.dataPort;
-    options.alias.canBind = [commandPort, dataPort](const std::string& address) {
-        return support::canBindUdpAddress(address, commandPort) &&
+    options.alias.canBind = [alivePort, commandPort, dataPort](const std::string& address) {
+        return support::canBindUdpAddress(address, alivePort) &&
+               support::canBindUdpAddress(address, commandPort) &&
                support::canBindUdpAddress(address, dataPort);
     };
     return options;
@@ -287,6 +298,7 @@ public:
         , address_(std::move(address))
         , serial_(serial)
         , options_(options)
+        , aliveSocket_(io)
         , commandSocket_(io)
         , dataSocket_(io)
         , playbackTimer_(io) {
@@ -302,7 +314,11 @@ public:
             error = "Invalid LaserCube listen address " + address_ + ".";
             return false;
         }
+        if (!openUdpSocket(aliveSocket_, *ip, options_.alivePort, error, "alive")) {
+            return false;
+        }
         if (!openUdpSocket(commandSocket_, *ip, options_.commandPort, error, "command")) {
+            close();
             return false;
         }
         if (!openUdpSocket(dataSocket_, *ip, options_.dataPort, error, "data")) {
@@ -316,6 +332,7 @@ public:
     void start(std::function<bool(const udp::endpoint&)> isOwnEndpoint) {
         isOwnEndpoint_ = std::move(isOwnEndpoint);
         running_ = true;
+        startAliveReceive();
         startCommandReceive();
         startDataReceive();
         startPlaybackTimer();
@@ -324,6 +341,7 @@ public:
     void close() {
         running_ = false;
         std::error_code ignored;
+        aliveSocket_.close(ignored);
         commandSocket_.close(ignored);
         dataSocket_.close(ignored);
         (void)playbackTimer_.cancel();
@@ -334,10 +352,26 @@ public:
         sendDatagram(commandSocket_, to, buildFullInfo());
     }
 
-    udp::endpoint commandEndpoint() const {
-        std::error_code ec;
-        auto endpoint = commandSocket_.local_endpoint(ec);
-        return ec ? udp::endpoint{} : endpoint;
+    /// Answer an ALIVE probe the way a LaserCube does: [0x27, 0x00] from the
+    /// device's alive port.
+    void replyAlive(const udp::endpoint& to) {
+        if (aliveClients_.insert(to.address().to_string()).second) {
+            libera::logInfo("[LaserCubeVirtual]", formatSerial(serial_),
+                            "answering LaserCube software at", to.address().to_string());
+        }
+        sendDatagram(aliveSocket_, to, {cmdAlive, 0x00});
+    }
+
+    std::vector<udp::endpoint> localEndpoints() const {
+        std::vector<udp::endpoint> result;
+        for (const auto* socket : {&aliveSocket_, &commandSocket_, &dataSocket_}) {
+            std::error_code ec;
+            auto endpoint = socket->local_endpoint(ec);
+            if (!ec) {
+                result.push_back(endpoint);
+            }
+        }
+        return result;
     }
 
     VirtualControllerEndpoint endpoint() const {
@@ -353,6 +387,7 @@ public:
         endpoint.address = address_;
         endpoint.port = options_.dataPort;
         endpoint.attributes["serial"] = serial;
+        endpoint.attributes["alive_port"] = std::to_string(options_.alivePort);
         endpoint.attributes["command_port"] = std::to_string(options_.commandPort);
         endpoint.attributes["data_port"] = std::to_string(options_.dataPort);
         endpoint.attributes["model_name"] = options_.modelName;
@@ -384,20 +419,40 @@ private:
         packet[2] = 0x00; // payload version
         packet[3] = options_.firmwareMajor;
         packet[4] = options_.firmwareMinor;
-        packet[5] = outputEnabled_ ? 0x01u : 0x00u; // output enabled; no interlock/temperature faults
+        // Flags: bit 0 output enabled, bit 1 as reported by a real Cube2 Ultra.
+        packet[5] = static_cast<std::uint8_t>(0x02u | (outputEnabled_ ? 0x01u : 0x00u));
+        packet[8] = 0xff; // 0x0fff as reported by a real cube (likely the 12-bit DAC maximum)
+        packet[9] = 0x0f;
         putLe32(10, pointRate_);
         putLe32(14, options_.maxPointRate);
+        packet[18] = 0x03; // unknown, as reported by a real cube
         putLe16(19, bufferFree());
         putLe16(21, options_.bufferCapacity);
-        packet[23] = 255; // battery: 255 means running on external power
-        packet[24] = 30;  // temperature in degrees C
+        packet[23] = 100; // battery percent
+        packet[24] = 25;  // temperature in degrees C
         packet[25] = options_.connectionType;
         std::copy(serial_.begin(), serial_.end(), packet.begin() + 26);
         std::copy(reportedAddress_.begin(), reportedAddress_.end(), packet.begin() + 32);
+        packet[36] = 0x02; // unknown, as reported by a real cube
         packet[37] = options_.modelNumber;
         std::copy(options_.modelName.begin(), options_.modelName.end(),
                   packet.begin() + static_cast<std::ptrdiff_t>(fullInfoModelNameOffset));
         return packet;
+    }
+
+    void startAliveReceive() {
+        aliveSocket_.async_receive_from(
+            asio::buffer(aliveBuffer_), aliveSender_,
+            [this](const std::error_code& ec, std::size_t size) {
+                if (!running_ || ec == asio::error::operation_aborted) {
+                    return;
+                }
+                if (!ec && size > 0 && size <= maxAliveRequestSize && aliveBuffer_[0] == cmdAlive &&
+                    !(isOwnEndpoint_ && isOwnEndpoint_(aliveSender_))) {
+                    replyAlive(aliveSender_);
+                }
+                startAliveReceive();
+            });
     }
 
     void startCommandReceive() {
@@ -648,11 +703,14 @@ private:
     std::array<std::uint8_t, 4> reportedAddress_{};
     const HostOptions& options_;
 
+    udp::socket aliveSocket_;
     udp::socket commandSocket_;
     udp::socket dataSocket_;
     asio::steady_timer playbackTimer_;
+    std::array<std::uint8_t, maxDatagramSize> aliveBuffer_{};
     std::array<std::uint8_t, maxDatagramSize> commandBuffer_{};
     std::array<std::uint8_t, maxDatagramSize> dataBuffer_{};
+    udp::endpoint aliveSender_;
     udp::endpoint commandSender_;
     udp::endpoint dataSender_;
     std::function<bool(const udp::endpoint&)> isOwnEndpoint_;
@@ -665,20 +723,25 @@ private:
     bool bufferResponseEnabled_ = true;
     std::uint64_t droppedPoints_ = 0;
     std::set<std::uint8_t> unknownCommandsLogged_;
+    std::set<std::string> aliveClients_;
     std::chrono::steady_clock::time_point lastPlaybackAt_{};
     double playbackAccumulator_ = 0.0;
     bool playbackClockValid_ = false;
 };
 
-/// Receives broadcast GET_FULL_INFO probes for all virtual LaserCubes. Device
+/// Receives broadcast ALIVE or GET_FULL_INFO probes for all virtual LaserCubes. Device
 /// sockets bound to a specific address do not see broadcasts on Linux or macOS,
 /// so probes arrive here and every device answers from its own socket.
 class DiscoveryListener {
 public:
     DiscoveryListener(asio::io_context& io,
+                      std::uint8_t command,
+                      std::size_t maxRequestSize,
                       std::function<void(const udp::endpoint&)> onProbe,
                       std::function<bool(const udp::endpoint&)> isOwnEndpoint)
         : socket_(io)
+        , command_(command)
+        , maxRequestSize_(maxRequestSize)
         , onProbe_(std::move(onProbe))
         , isOwnEndpoint_(std::move(isOwnEndpoint)) {}
 
@@ -710,8 +773,8 @@ private:
                 if (!running_ || ec == asio::error::operation_aborted) {
                     return;
                 }
-                if (!ec && size > 0 && size <= maxFullInfoRequestSize &&
-                    buffer_[0] == cmdGetFullInfo && !(isOwnEndpoint_ && isOwnEndpoint_(sender_))) {
+                if (!ec && size > 0 && size <= maxRequestSize_ &&
+                    buffer_[0] == command_ && !(isOwnEndpoint_ && isOwnEndpoint_(sender_))) {
                     onProbe_(sender_);
                 }
                 startReceive();
@@ -719,6 +782,8 @@ private:
     }
 
     udp::socket socket_;
+    std::uint8_t command_;
+    std::size_t maxRequestSize_;
     std::function<void(const udp::endpoint&)> onProbe_;
     std::function<bool(const udp::endpoint&)> isOwnEndpoint_;
     std::array<std::uint8_t, maxDatagramSize> buffer_{};
@@ -833,7 +898,7 @@ VirtualControllerHostRegistrar gLaserCubeVirtualControllerHostRegistrar({
                 "Max Point Rate",
                 "Maximum point rate reported to LaserCube software.",
                 VirtualControllerHostOptionType::Integer,
-                "40000",
+                "35000",
                 {},
                 false,
             },
@@ -966,7 +1031,9 @@ bool LaserCubeVirtualControllerHost::start(const VirtualControllerHostContext& c
         if (!device->open(error)) {
             return fail();
         }
-        impl_->ownEndpoints.push_back(device->commandEndpoint());
+        for (const auto& local : device->localEndpoints()) {
+            impl_->ownEndpoints.push_back(local);
+        }
         impl_->devices.push_back(std::move(device));
     }
 
@@ -974,26 +1041,45 @@ bool LaserCubeVirtualControllerHost::start(const VirtualControllerHostContext& c
         const auto bindAddresses = impl_->options.discoveryBindAuto
             ? automaticDiscoveryBindAddresses(addresses)
             : impl_->options.discoveryBindAddresses;
+        struct ProbeKind {
+            std::uint16_t port;
+            std::uint8_t command;
+            std::size_t maxRequestSize;
+            bool alive;
+        };
+        const ProbeKind kinds[] = {
+            {impl_->options.alivePort, cmdAlive, maxAliveRequestSize, true},
+            {impl_->options.commandPort, cmdGetFullInfo, maxFullInfoRequestSize, false},
+        };
         for (const auto& bindAddress : bindAddresses) {
-            auto listener = std::make_unique<DiscoveryListener>(
-                impl_->io,
-                [this](const udp::endpoint& sender) {
-                    for (auto& device : impl_->devices) {
-                        device->replyFullInfo(sender);
+            for (const auto& kind : kinds) {
+                const bool alive = kind.alive;
+                auto listener = std::make_unique<DiscoveryListener>(
+                    impl_->io,
+                    kind.command,
+                    kind.maxRequestSize,
+                    [this, alive](const udp::endpoint& sender) {
+                        for (auto& device : impl_->devices) {
+                            if (alive) {
+                                device->replyAlive(sender);
+                            } else {
+                                device->replyFullInfo(sender);
+                            }
+                        }
+                    },
+                    [this](const udp::endpoint& sender) { return impl_->isOwnEndpoint(sender); });
+                std::string listenerError;
+                if (!listener->open(bindAddress, kind.port, listenerError)) {
+                    if (bindAddress != "255.255.255.255" && impl_->options.discoveryBindAuto) {
+                        // Subnet broadcast binds are best effort.
+                        libera::logInfo("[LaserCubeVirtual]", listenerError);
+                        continue;
                     }
-                },
-                [this](const udp::endpoint& sender) { return impl_->isOwnEndpoint(sender); });
-            std::string listenerError;
-            if (!listener->open(bindAddress, impl_->options.commandPort, listenerError)) {
-                if (bindAddress != "255.255.255.255" && impl_->options.discoveryBindAuto) {
-                    // Subnet broadcast binds are best effort.
-                    libera::logInfo("[LaserCubeVirtual]", listenerError);
-                    continue;
+                    error = listenerError;
+                    return fail();
                 }
-                error = listenerError;
-                return fail();
+                impl_->discovery.push_back(std::move(listener));
             }
-            impl_->discovery.push_back(std::move(listener));
         }
     }
 

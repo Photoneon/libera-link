@@ -176,12 +176,14 @@ void appendU16(std::vector<std::uint8_t>& out, std::uint16_t value) {
 }
 
 void testProtocol() {
+    constexpr std::uint16_t alivePort = 46456;
     constexpr std::uint16_t commandPort = 46457;
     constexpr std::uint16_t dataPort = 46458;
     auto sink = std::make_shared<RecordingSink>("helios:test-1");
     std::string error;
     auto host = createHost({
         {"addresses", "127.0.0.1"},
+        {"alive_port", std::to_string(alivePort)},
         {"command_port", std::to_string(commandPort)},
         {"data_port", std::to_string(dataPort)},
         // Probes sent to 127.0.0.2 reach the wildcard discovery socket rather
@@ -225,9 +227,30 @@ void testProtocol() {
             ASSERT_EQ(status->bufferFree, 1000, "empty buffer");
             ASSERT_EQ(status->pointRateMax, 50000u, "max point rate");
             ASSERT_TRUE(status->outputEnabled, "output enabled at start");
-            ASSERT_TRUE(status->isPluggedIn(), "reports external power");
+            ASSERT_EQ(status->modelNumber, 6, "model number of a Cube2 Ultra");
+            ASSERT_TRUE(status->firmwareVersion == "0.23", "firmware version of a real cube");
         }
     }
+
+    // LaserOS discovery: ALIVE (0x27) on the alive port, answered with
+    // [0x27, 0x00] from the device's alive port. Both unicast and through the
+    // shared broadcast listener.
+    for (const char* destination : {"127.0.0.1", "127.0.0.2"}) {
+        client.send(destination, alivePort, {0x27});
+        from = {};
+        auto alive = client.receive(1000ms, &from);
+        ASSERT_TRUE(alive.has_value(), "alive reply");
+        if (alive) {
+            ASSERT_EQ(alive->size(), std::size_t{2}, "alive reply is two bytes");
+            ASSERT_EQ((*alive)[0], 0x27, "alive reply command");
+            ASSERT_EQ((*alive)[1], 0x00, "alive reply status");
+            ASSERT_TRUE(from.address().to_string() == "127.0.0.1", "alive reply from the device address");
+            ASSERT_EQ(from.port(), alivePort, "alive reply from the alive port");
+        }
+    }
+    // An alive reply from another cube must not be answered.
+    client.send("127.0.0.1", alivePort, {0x27, 0x00});
+    ASSERT_TRUE(!client.receive(200ms).has_value(), "alive replies are not answered");
 
     // A 64-byte status packet (another cube's reply) must not be answered.
     {
@@ -316,6 +339,7 @@ void testProtocol() {
     // Restart on the same ports works (sockets were released).
     auto restarted = createHost({
         {"addresses", "127.0.0.1"},
+        {"alive_port", std::to_string(alivePort)},
         {"command_port", std::to_string(commandPort)},
         {"data_port", std::to_string(dataPort)},
         {"discovery", "false"},
