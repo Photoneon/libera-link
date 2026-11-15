@@ -85,10 +85,39 @@ The app currently exposes these built-in virtual controller hosts:
 - `idn`: exposes linked controllers as IDN services. This is the default.
 - `libera`: exposes linked controllers through the Libera protocol with UDP
   discovery advertisements and TCP sessions.
+- `lasercube`: exposes each linked controller as a network LaserCube, so
+  LaserOS and other LaserCube WiFi/LAN software can discover and drive it.
 
 An Ether Dream virtual-controller host implementation also exists in-tree for
-tests and future UI work, but the app currently loads the `idn` and `libera`
-host registrations.
+tests and future UI work, but the app currently loads the `idn`, `libera`, and
+`lasercube` host registrations.
+
+### LaserCube
+
+The LaserCube host answers LaserCube network discovery (UDP 45457) and accepts
+point data on UDP 45458. Each virtual LaserCube reports a 6000-point buffer and
+acknowledges every data packet with its free buffer space, which LaserCube
+software uses for pacing. Points play out at the rate the software selects.
+
+Because LaserCube software tells devices apart by IP address, each virtual
+LaserCube needs its own local IPv4 address. With `ip_mode=auto` (the default),
+one controller uses this machine's address. Additional controllers get IP
+aliases on the default interface, as with the Ether Dream host. Use
+`addresses=ip1,ip2,...` to pin preconfigured addresses, or `ip_mode=alias` to
+always use aliases.
+
+```bash
+./build/libera-link-cli --virtual-controller lasercube
+./build/libera-link-cli --virtual-controller lasercube \
+    --virtual-controller-opt addresses=192.168.1.240,192.168.1.241
+```
+
+The LaserCube ports can only be shared between programs that all enable
+address reuse. If **LaserCube Net** discovery is enabled in the same Libera
+Link instance, or LaserOS runs on the same machine, the host may fail to bind
+45457. In that case, disable LaserCube Net under **Settings > Controller
+Discovery**, or run LaserOS on another computer. Libera Link never links its
+own virtual LaserCubes as physical controllers.
 
 More virtual controller hosts can be added in code. See [Writing a virtual
 controller host](docs/virtual-controller-hosts.md).

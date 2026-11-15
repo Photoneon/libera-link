@@ -2,6 +2,7 @@
 #include "LiberaPaths.hpp"
 #include "virtual_controller/IdnVirtualControllerHost.hpp"
 #include "virtual_controller/LiberaProtocolVirtualControllerHost.hpp"
+#include "virtual_controller/LaserCubeVirtualControllerHost.hpp"
 #include "virtual_controller/VirtualControllerHostRegistry.hpp"
 
 #include "libera/System.hpp"
@@ -391,6 +392,7 @@ std::string trimLogLine(std::string_view line) {
 void printUsageImpl(const char* exe, std::ostream& out) {
     virtual_controller::ensureBuiltInIdnVirtualControllerHostLinked();
     virtual_controller::ensureBuiltInLiberaProtocolVirtualControllerHostLinked();
+    virtual_controller::ensureBuiltInLaserCubeVirtualControllerHostLinked();
     const auto defaultVirtualControllerHost = virtual_controller::defaultVirtualControllerHost();
     const auto availableVirtualControllerHosts = virtual_controller::availableVirtualControllerHosts();
     out << "Usage: " << exe << " [options]\n"
@@ -1496,6 +1498,12 @@ bool shouldLinkController(const libera::core::ControllerInfo& info, std::string&
         }
     }
 
+    if (info.type() == libera::lasercubenet::LaserCubeNetControllerInfo::controllerType() &&
+        virtual_controller::isVirtualLaserCubeSerial(info.idValue())) {
+        reason = "virtual LaserCube endpoint";
+        return false;
+    }
+
     reason.clear();
     return true;
 }
@@ -1760,6 +1768,7 @@ ParseResult parseOptions(int argc, char** argv, LinkOptions& options) {
     configureLiberaPluginDirectories();
     virtual_controller::ensureBuiltInIdnVirtualControllerHostLinked();
     virtual_controller::ensureBuiltInLiberaProtocolVirtualControllerHostLinked();
+    virtual_controller::ensureBuiltInLaserCubeVirtualControllerHostLinked();
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--help") {
@@ -1874,6 +1883,7 @@ LinkRuntime::LinkRuntime()
     configureLiberaPluginDirectories();
     virtual_controller::ensureBuiltInIdnVirtualControllerHostLinked();
     virtual_controller::ensureBuiltInLiberaProtocolVirtualControllerHostLinked();
+    virtual_controller::ensureBuiltInLaserCubeVirtualControllerHostLinked();
 
     std::weak_ptr<RuntimeLogger> weakLogger = impl_->logger;
     libera::setLogHandlers(

@@ -117,8 +117,10 @@ add_library(libera_link_core STATIC
     src/LinkRuntime.cpp
     src/virtual_controller/EtherDreamVirtualControllerHost.cpp
     src/virtual_controller/IdnVirtualControllerHost.cpp
+    src/virtual_controller/LaserCubeVirtualControllerHost.cpp
     src/virtual_controller/LiberaProtocolVirtualControllerHost.cpp
     src/virtual_controller/VirtualControllerHostRegistry.cpp
+    src/virtual_controller/VirtualControllerHostSupport.cpp
     src/LiberaPaths.cpp
     src/AvbSettings.cpp
 )
@@ -187,6 +189,12 @@ libera_apply_sanitizers(test_etherdream_virtual_controller_host)
 target_link_libraries(test_etherdream_virtual_controller_host PRIVATE libera_link_core)
 libera_link_copy_libusb_runtime(test_etherdream_virtual_controller_host)
 
+add_executable(test_lasercube_virtual_controller_host
+    tests/test_lasercube_virtual_controller_host.cpp)
+libera_apply_sanitizers(test_lasercube_virtual_controller_host)
+target_link_libraries(test_lasercube_virtual_controller_host PRIVATE libera_link_core)
+libera_link_copy_libusb_runtime(test_lasercube_virtual_controller_host)
+
 add_executable(test_libera_protocol_virtual_controller_host
     tests/test_libera_protocol_virtual_controller_host.cpp)
 libera_apply_sanitizers(test_libera_protocol_virtual_controller_host)
@@ -197,6 +205,8 @@ if(BUILD_TESTING)
   add_test(NAME test_point_stream_framer COMMAND test_point_stream_framer)
   add_test(NAME test_etherdream_virtual_controller_host
       COMMAND test_etherdream_virtual_controller_host)
+  add_test(NAME test_lasercube_virtual_controller_host
+      COMMAND test_lasercube_virtual_controller_host)
   add_test(NAME test_libera_protocol_virtual_controller_host
       COMMAND test_libera_protocol_virtual_controller_host)
 endif()
